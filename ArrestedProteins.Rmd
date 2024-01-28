@@ -1,0 +1,301 @@
+---
+title: "ArrestedProteins"
+author: "Vanessa Linke"
+date: "2024-01-28"
+output: html_document
+---
+
+# 0. Set up and define functions.
+
+```{r setup}
+library(tidyverse)
+library(ggrepel)
+library(fuzzyjoin)
+
+ann_colors = list(Group = c(`ATP_ELU` = "#059A84",
+                            `FLP_ELU` = "#7D85DE",
+                            `ILE_ELU` = "#BEBEDA",
+                            `ATP_INP` ="#464646",
+                            `FLP_INP` = "#B98C64",
+                            `ILE_INP` = "#F8C2B4"))
+
+input <- list()
+input$pvalue <- 0.05 #set p value cutoff
+input$FC <- 1 #set fold change cutoff
+input$groupofinterest <- "ELU" #"ELU" vs. "INP"
+input$condition <- "ATP" 
+input$control <- "FLP" #"FLP" vs. "ILE"
+
+ttest <- function(df, grp1, grp2){ 
+  x = df[grp1]
+  y = df[grp2]
+  x = as.numeric(x)
+  y = as.numeric(y)
+  results = t.test(x,y, 
+                   alternative = 'two.sided', 
+                   paired = T)
+  results$p.value
+}
+
+impute_data = function(df, width = 0.3, downshift = 1.8) {
+  # df = data frame containing filtered 
+  # Assumes missing data (in df) follows a narrowed and downshifted normal distribution
+  #https://datascienceplus.com/proteomics-data-analysis-2-3-data-filtering-and-missing-value-imputation/
+  # Create new column indicating whether the values are imputed 
+  df$imputed = !is.finite(df$LFQvalue)
+  
+  # Imputation
+  temp <- df$LFQvalue 
+  temp[!is.finite(temp)] = NA #make sure all non-finite values are really NA
+  temp.sd = width * sd(temp, na.rm = TRUE)   # shrink sd width
+  temp.mean = mean(temp, na.rm = TRUE) - 
+    downshift * sd(temp, na.rm = TRUE)   # shift mean of imputed values
+  n.missing = sum(is.na(temp))
+  temp[is.na(temp)] = rnorm(n.missing, mean = temp.mean, sd = temp.sd)
+  
+  df$LFQvalue <- temp
+  
+  return(df)
+}
+
+```
+
+
+# 1. Data
+
+Load the data.
+
+```{r data}
+LFQ <- read_csv(file = "Human_LFQ_t.csv") #quantitative data
+LFQ_long <- LFQ %>%
+  pivot_longer(!c(Group, Sample), 
+               names_to = "Protein.ID", 
+               values_to = "LFQvalue") 
+
+MQ <-read_csv(file = "Human_MQ.csv") #metadata from MaxQuant
+
+mitocarta <- read_csv(file = "Human.MitoCarta3.0.csv") #MitoCarta 3.0 (Rath et al. 2021)
+mitocarta_regex <- mitocarta |> 
+  mutate(regex = str_c(Symbol, Synonyms, sep = "|") |>
+           str_remove_all(" ") |> 
+           str_remove("\\|$") |> 
+           str_replace_all("\\|", "$\\|^"),
+         regex = str_c("^", regex, "$")
+  )
+
+meta <- MQ |> 
+  regex_left_join(mitocarta_regex, by = c(`Gene names` = "regex")) |> 
+  select(-regex)
+
+# Define proteins to be highlighted
+highlights <- read_csv("volcano_highlights_PB_2022_12_12.csv", col_select = 1:6)
+highlights <- subset(highlights, Species == "Human")
+highlights$Label_easy <- ifelse(grepl("TIM|PAM", highlights$Label), "TIM", highlights$Label)
+
+```
+
+# 2. Imputation
+
+Now, let's impute the missing data (by group to account for large differences in LOAD vs ELU).
+
+```{r imputation}
+## Apply imputation by group (LOAD vs ELU)
+LFQ_long_total <- LFQ_long[grep(input$control, LFQ_long$Group, invert=T),]
+LFQ_long_ELU <- LFQ_long[grep(input$control, LFQ_long$Group),]
+
+LFQ.imp_total <- impute_data(data.frame(LFQ_long_total))
+LFQ.imp_ELU <-impute_data(data.frame(LFQ_long_ELU))
+
+LFQ.imp_bygroup <- rbind(LFQ.imp_ELU, LFQ.imp_total)
+
+#convert to wide format
+LFQ.imp_wide <- pivot_wider(LFQ.imp_bygroup[,c(1,3,4)], 
+                            names_from = Sample, 
+                            values_from = LFQvalue)
+rownames(LFQ.imp_wide) <- LFQ.imp_wide$Protein.ID
+
+grp_ctr <- colnames(LFQ.imp_wide)[apply(sapply(X = c(input$control, input$groupofinterest), 
+                                               FUN = grepl, colnames(LFQ.imp_wide)), 
+                                        MARGIN =  1, FUN = all)]
+
+grp_cond <- colnames(LFQ.imp_wide)[apply(sapply(X = c(input$condition, input$groupofinterest), 
+                                                FUN = grepl, colnames(LFQ.imp_wide)), 
+                                         MARGIN =  1, FUN = all)]
+```
+
+# 3. Calculation of fold change and p-value.
+
+```{r calcs}
+
+pvalue = apply(LFQ.imp_wide, 1, ttest, grp1 = grp_ctr, grp2 = grp_cond) 
+
+# FOLDCHANGE CALC
+mean <- LFQ.imp_bygroup %>%
+  dplyr::select(-Sample) %>%
+  group_by(Group, Protein.ID) %>%
+  summarise(
+    mean=mean(LFQvalue)
+  )
+
+mean <- pivot_wider(mean, names_from = Group, values_from = mean)
+colnames(mean) <- str_replace(colnames(mean), "-", ".")
+
+# calculate FC as difference between log2 averages
+foldchange <- data.frame(foldchange=mean[[paste(input$condition,input$groupofinterest, sep = "_")]] -
+                           mean[[paste(gsub('^', '', input$control, fixed =  T),input$groupofinterest, sep = "_")]]) 
+rownames(foldchange) <- mean$Protein.ID
+
+# for volcano plot: save FC and p-values in one dataframe
+volcano <- merge(foldchange, pvalue, by=0)
+colnames(volcano)[3] <- "pvalue"
+colnames(volcano)[1] <- "Protein ID"
+volcano$sig <- ifelse(abs(volcano$foldchange)>as.numeric(input$FC)&
+                        volcano$pvalue<as.numeric(input$pvalue),
+                      yes = TRUE, no = FALSE)
+
+volcano <- merge(volcano, meta, by.x = "Protein ID", by.y = "Protein IDs")
+
+volcano_regex <- volcano |> 
+  mutate(regex = str_c(`Gene names`, str_replace_na(Symbol), str_replace_na(Synonyms), sep = "|") |> 
+           str_remove_all(" ") |> 
+           str_remove("\\|$") |> 
+           str_replace_all("\\|", "$\\|^") |>
+           str_replace_all(";", "$\\|^"),
+         regex = str_c("^", regex, "$")
+  )
+
+volcano.highlights <- highlights |> 
+  regex_left_join(volcano_regex, by = c(ID = "regex")) |> 
+  select(`Gene names`, ID, Label, Species, Identifier, Protein.name, Label_easy)
+
+volcano <- merge(volcano.highlights, volcano, by = "Gene names", all.y = T) 
+
+volcano <- volcano %>% mutate(
+  Label1 = ifelse(Label=="Proteasome", NA, Label_easy),
+  Label2 = ifelse(Label=="Proteasome", Label_easy, NA)
+) %>% arrange(desc(Label)) 
+
+
+```
+
+# 4. PLOTS 
+
+## Volcano plot with subunits labeled.
+
+```{r volcano}
+
+pdf("volcano_subunit.pdf",         # File name
+    width = 8, height = 6, # in inches
+    bg = "white",          # Background color
+    paper = "A4")          # Paper size
+
+  ggplot(volcano[order(volcano$Label1, na.last = F),],
+       aes(x = foldchange, y = -log10(pvalue), 
+                      label = `Gene names`, 
+                      label2 = `Protein names`,
+                      alpha = !(is.na(Label1)),
+                      color = Label1
+)) + 
+  geom_point() +
+  geom_hline(yintercept=-log10(as.numeric(input$pvalue)), size = 0.3, linetype="dashed", color = "lightgrey") +
+  geom_vline(xintercept=as.numeric(input$FC), size = 0.3, linetype="dashed", color = "lightgrey") +
+  geom_vline(xintercept=-as.numeric(input$FC), size = 0.3, linetype="dashed", color = "lightgrey") +
+  xlab(paste("Log2 Fold change (", paste(input$condition,input$groupofinterest, sep = "_"), "/", paste(input$control,input$groupofinterest, sep = "_"), ")")) +
+  ylab("-log10(p-value)") +
+  geom_text_repel(verbose = TRUE,
+                  max.time = 30,
+                  max.iter = 100000,
+                  size = 2, 
+                  segment.size = 0.1,
+                  max.overlaps = Inf,
+                  aes(label=ifelse(!is.na(Label1)&sig,
+                  as.character(Symbol), ''))
+  ) +
+    theme_classic() +
+  ylim(0,5) +
+    scale_x_continuous(breaks = seq(-6, 6, 2), limits = c(-6.5, 6.5)) +
+    scale_alpha_discrete(c(0.25,1)) +
+  scale_color_manual("Subunits", values=as.character(c(ann_colors$Group[2], "orange",
+                      ann_colors$Group[1], "grey"))) +
+   theme(legend.position="bottom") +
+  guides(alpha = "none")
+  
+# Closing the graphical device
+dev.off() 
+
+```
+
+
+## Volcano plot with proteasome highlights.
+
+```{r volcano2}
+
+pdf("volcano_proteasome.pdf",         # File name
+    width = 8, height = 6, # in inches
+    bg = "white",          # Background color
+    paper = "A4")          # Paper size
+
+  ggplot(volcano[order(volcano$Label2, na.last = F),],
+       aes(x = foldchange, y = -log10(pvalue), 
+                      label = `Gene names`, 
+                      label2 = `Protein names`,
+                      alpha = !(is.na(Label2)),
+                      color = Label2
+)) + 
+  geom_point() +
+  geom_hline(yintercept=-log10(as.numeric(input$pvalue)), size = 0.3, linetype="dashed", color = "lightgrey") +
+  geom_vline(xintercept=as.numeric(input$FC), size = 0.3, linetype="dashed", color = "lightgrey") +
+  geom_vline(xintercept=-as.numeric(input$FC), size = 0.3, linetype="dashed", color = "lightgrey") +
+  xlab(paste("Log2 Fold change (", paste(input$condition,input$groupofinterest, sep = "_"), "/", paste(input$control,input$groupofinterest, sep = "_"), ")")) +
+  ylab("-log10(p-value)") +
+  geom_text_repel(verbose = TRUE,
+                  max.time = 30,
+                  max.iter = 100000,
+                  size = 2, 
+                  segment.size = 0.1,
+                  max.overlaps = Inf,
+                  aes(label=ifelse(!is.na(Label2)&sig, as.character(`Gene names`), ''))
+  ) +
+    theme_classic() +
+  ylim(0,5) +
+  scale_x_continuous(breaks = seq(-6, 6, 2), limits = c(-6.5, 6.5)) +
+    scale_alpha_discrete(c(0.25,1)) +
+  scale_color_manual("Legend", values=as.character(c("tomato", "grey"))) +
+    theme(legend.position="bottom") +
+  guides(alpha = "none")
+    
+# Closing the graphical device
+dev.off() 
+```
+
+# 5. Save data as csv table.
+
+```{r table}
+volcano %>% select( -Label2) %>% 
+  write_csv("table.csv")
+  
+volcano %>% select(`Gene names`,
+                   `Protein ID`,
+                   `Protein names`,
+                   foldchange,
+                   pvalue,
+                   sig,
+                   Label,
+                   `IMPI listed`,
+                   MitoCarta3.0_List,
+                   MitoCarta3.0_Evidence,
+                   MitoCarta3.0_SubMitoLocalization,
+                   MitoCarta3.0_MitoPathways,
+                   HumanGeneID,
+                   MouseOrthologGeneID,
+                   Symbol,
+                   Synonyms,
+                   Description,
+                   EnsemblGeneID_mapping_version_20200130,
+                   UniProt
+                   ) %>% 
+  write_csv("table_short.csv")
+  
+```
+
+The end.
